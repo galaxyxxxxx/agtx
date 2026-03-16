@@ -8,7 +8,7 @@ use ratatui::{prelude::*, widgets::*};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
 use std::time::Instant;
 
 use crate::agent::{self, AgentOperations};
@@ -242,6 +242,9 @@ struct AppState {
     plugin_select_popup: Option<PluginSelectPopup>,
     // Orchestrator agent tmux target (e.g. "project:orchestrator")
     orchestrator_session: Option<String>,
+    // Set to true once the orchestrator agent is ready and has received the skill command.
+    // Gates notification delivery so we don't send into a pane that's still initializing.
+    orchestrator_ready: Arc<AtomicBool>,
     // Orchestrator idle detection for push notifications
     orchestrator_last_content: String,
     orchestrator_stable_since: Option<Instant>,
@@ -553,6 +556,7 @@ impl App {
                 warning_message: None,
                 plugin_select_popup: None,
                 orchestrator_session: None,
+                orchestrator_ready: Arc::new(AtomicBool::new(false)),
                 orchestrator_last_content: String::new(),
                 orchestrator_stable_since: None,
                 orchestrator_last_check: Instant::now(),
@@ -576,6 +580,7 @@ impl App {
             let orch_target = format!("{}:orchestrator", app.state.project_name);
             if app.state.tmux_ops.window_exists(&orch_target).unwrap_or(false) {
                 app.state.orchestrator_session = Some(orch_target);
+                app.state.orchestrator_ready.store(true, Ordering::Release);
 
                 // Catch up: notify orchestrator about tasks that completed while TUI was down
                 if let Some(ref db) = app.state.db {
@@ -699,6 +704,7 @@ impl App {
                 warning_message: None,
                 plugin_select_popup: None,
                 orchestrator_session: None,
+                orchestrator_ready: Arc::new(AtomicBool::new(false)),
                 orchestrator_last_content: String::new(),
                 orchestrator_stable_since: None,
                 orchestrator_last_check: Instant::now(),
@@ -4459,6 +4465,7 @@ impl App {
             } else {
                 // Window gone, clear the session
                 self.state.orchestrator_session = None;
+                self.state.orchestrator_ready.store(false, Ordering::Release);
             }
         }
 
@@ -4502,6 +4509,7 @@ impl App {
         )?;
 
         self.state.orchestrator_session = Some(orch_target.clone());
+        self.state.orchestrator_ready.store(false, Ordering::Release);
 
         // Open the popup immediately so the user can see the orchestrator starting
         let mut popup = ShellPopup::new("Orchestrator".to_string(), orch_target.clone());
@@ -4522,10 +4530,12 @@ impl App {
         let skill_cmd = skills::transform_plugin_command("/agtx:orchestrate", &default_agent)
             .unwrap_or_else(|| "/agtx:orchestrate".to_string());
         let tmux_ops = Arc::clone(&self.state.tmux_ops);
+        let ready_flag = Arc::clone(&self.state.orchestrator_ready);
         let target = orch_target;
         std::thread::spawn(move || {
             if let Some(ready_target) = wait_for_agent_ready(&tmux_ops, &target) {
                 let _ = tmux_ops.send_keys(&ready_target, &skill_cmd);
+                ready_flag.store(true, Ordering::Release);
             }
         });
 
@@ -4617,6 +4627,11 @@ impl App {
             None => return,
         };
 
+        // Don't deliver until the agent is ready and has received the skill command
+        if !self.state.orchestrator_ready.load(Ordering::Acquire) {
+            return;
+        }
+
         // Check window still exists
         if !self.state.tmux_ops.window_exists(&orch_target).unwrap_or(false) {
             return;
@@ -4627,24 +4642,27 @@ impl App {
             .capture_pane(&orch_target)
             .unwrap_or_default();
 
-        if current_content != self.state.orchestrator_last_content {
-            // Content changed — agent is working, reset idle timer
-            self.state.orchestrator_last_content = current_content;
-            self.state.orchestrator_stable_since = Some(Instant::now());
-            return;
-        }
+        let result = check_orchestrator_idle(
+            &current_content,
+            &self.state.orchestrator_last_content,
+            self.state.orchestrator_stable_since,
+        );
 
-        // Content unchanged — check if stable long enough (≥3s)
-        let stable_since = match self.state.orchestrator_stable_since {
-            Some(t) => t,
-            None => {
+        match result {
+            OrchestratorIdleResult::Idle => {
+                // Fall through to deliver notifications
+            }
+            OrchestratorIdleResult::Busy => {
+                self.state.orchestrator_last_content = current_content;
                 self.state.orchestrator_stable_since = Some(Instant::now());
                 return;
             }
-        };
-
-        if stable_since.elapsed() < std::time::Duration::from_secs(3) {
-            return;
+            OrchestratorIdleResult::Waiting => {
+                if self.state.orchestrator_stable_since.is_none() {
+                    self.state.orchestrator_stable_since = Some(Instant::now());
+                }
+                return;
+            }
         }
 
         // Orchestrator is idle — deliver pending notifications
@@ -4960,6 +4978,57 @@ impl Drop for App {
 }
 
 /// Ensure tmux session exists for a project
+// =============================================================================
+// Orchestrator idle detection (extracted for testability)
+// =============================================================================
+
+/// Result of checking whether the orchestrator is idle and ready for notifications.
+#[derive(Debug, PartialEq)]
+enum OrchestratorIdleResult {
+    /// Agent is idle — safe to deliver notifications.
+    Idle,
+    /// Content changed and no idle signal — agent is actively working.
+    Busy,
+    /// Content unchanged but not stable long enough — keep waiting.
+    Waiting,
+}
+
+/// Idle detection duration for the stability fallback (no `[agtx:idle]` signal).
+const ORCHESTRATOR_IDLE_FALLBACK_SECS: u64 = 15;
+
+/// Pure idle-detection logic for the orchestrator pane.
+///
+/// Checks two conditions (first match wins):
+/// 1. **Explicit signal**: pane content contains `[agtx:idle]` → `Idle`
+/// 2. **Stability fallback**: pane unchanged for ≥15s → `Idle`
+///
+/// Returns `Busy` when content changed without the idle signal,
+/// `Waiting` when content is unchanged but the timer hasn't elapsed.
+fn check_orchestrator_idle(
+    current_content: &str,
+    last_content: &str,
+    stable_since: Option<Instant>,
+) -> OrchestratorIdleResult {
+    let has_idle_signal = current_content.contains("[agtx:idle]");
+    let content_changed = current_content != last_content;
+
+    if content_changed {
+        if has_idle_signal {
+            OrchestratorIdleResult::Idle
+        } else {
+            OrchestratorIdleResult::Busy
+        }
+    } else {
+        // Content unchanged — check stability timer
+        match stable_since {
+            Some(t) if t.elapsed() >= std::time::Duration::from_secs(ORCHESTRATOR_IDLE_FALLBACK_SECS) => {
+                OrchestratorIdleResult::Idle
+            }
+            _ => OrchestratorIdleResult::Waiting,
+        }
+    }
+}
+
 fn ensure_project_tmux_session(project_name: &str, project_path: &Path, tmux_ops: &dyn TmuxOperations) {
     if !tmux_ops.has_session(project_name) {
         let _ = tmux_ops.create_session(project_name, &project_path.to_string_lossy());
