@@ -34,7 +34,7 @@
 
 ## Why agtx?
 
-AI coding tools give you one agent, one task, one terminal. agtx gives you a **kanban board where multiple coding agents work in parallel** — each in its own git worktree, each in its own tmux window, each running autonomously through a spec-driven workflow managed by an orchestrator agent.
+AI coding tools give you one agent, one task, one terminal. agtx gives you a **kanban board where multiple coding agents work in parallel** — each in its own git worktree, each in its own tmux window, running autonomously through a spec-driven workflow managed by an orchestrator agent.
 
 With the orchestrator, you don't even manage the board yourself. **An AI agent picks up tasks, delegates work, and ensures getting things done** through planning, implementation, review and resolving conflicts — while you focus on what matters: research, defining tasks, and merging changes.
 
@@ -60,8 +60,6 @@ curl -fsSL https://raw.githubusercontent.com/fynnfluegge/agtx/main/install.sh | 
 cd your-project && agtx
 ```
 
-That's it. Add tasks, press `m` to start agents, watch them work.
-
 ```bash
 # Dashboard mode — manage all projects
 agtx -g
@@ -73,10 +71,8 @@ agtx --experimental
 > [!NOTE]
 > Add `.agtx/` to your project's `.gitignore` to avoid committing worktrees and local task data.
 
-<details>
-<summary>Install from source</summary>
-
 ```bash
+# Install from source
 cargo build --release
 cp target/release/agtx ~/.local/bin/
 ```
@@ -179,7 +175,7 @@ running = "codex"
 
 ## Plugins
 
-One TOML file. That's all it takes to plug any spec-driven framework into the task lifecycle. Define commands, prompts, and artifacts — agtx handles phase gating, artifact polling, worktree sync, agent switching, and autonomous execution.
+Plug any spec-driven framework into the task lifecycle. Define commands, prompts, and artifacts — agtx handles phase gating, artifact polling, worktree sync, agent switching, and autonomous execution.
 
 Press `P` to switch plugins. Ships with 7 built-in:
 
